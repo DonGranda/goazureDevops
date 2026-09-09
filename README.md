@@ -32,11 +32,6 @@ chart, so the container deploys as-is.
   - [Step 7: Store secrets in each GitHub Environment](#step-7-store-secrets-in-each-github-environment)
   - [Step 8: Add the workflow](#step-8-add-the-workflow)
   - [Step 9: Open a pull request, or trigger it manually](#step-9-open-a-pull-request-or-trigger-it-manually)
-  - [Step 10: Verify the pushed image](#step-10-verify-the-pushed-image)
-- [How the OIDC authentication works](#how-the-oidc-authentication-works)
-- [Doing it without `az` / `gh` (Portal and UI alternatives)](#doing-it-without-az--gh-portal-and-ui-alternatives)
-- [Troubleshooting](#troubleshooting)
-
 ---
 
 ## 1. Run the app locally
