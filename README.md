@@ -1,4 +1,4 @@
-# myapp
+<!-- <!-- # myapp
 
 A minimal Go HTTP server (stdlib only, no dependencies) with:
 
@@ -9,38 +9,134 @@ A minimal Go HTTP server (stdlib only, no dependencies) with:
 These match the liveness/readiness probe paths in the Helm chart from the
 CI/CD pipeline, so this app deploys as-is.
 
-## Run locally without Docker
+# -->
+# GitHub Actions → Azure Container Registry using OIDC
+
+This project uses **GitHub Actions OIDC** to securely build and push Docker images to Azure Container Registry (ACR).
+
+No Azure client secret is required.
+
+## 1. Set Variables
 
 ```bash
-go run ./cmd/app
-curl localhost:8080/
+APP_NAME="github-actions-acr"
+GITHUB_ORG="<YOUR_GITHUB_ORG>"
+GITHUB_REPO="<YOUR_GITHUB_REPO>"
+ACR_NAME="<YOUR_ACR_NAME>"
+GITHUB_ENVIRONMENT="<YOUR_GITHUB_ENVIRONMENT>"
 ```
 
-## Run with Docker
+## 2. Create Azure Application
 
 ```bash
-docker build -t myapp:local .
-docker run --rm -p 8080:8080 myapp:local
+APP_ID=$(az ad app create \
+  --display-name "$APP_NAME" \
+  --query appId -o tsv)
+
+az ad sp create --id "$APP_ID"
 ```
 
-Then in another terminal:
+## 3. Give Access to ACR
 
 ```bash
-curl localhost:8080/
-curl localhost:8080/healthz
-curl localhost:8080/readyz
+ACR_ID=$(az acr show \
+  --name "$ACR_NAME" \
+  --query id -o tsv)
+
+az role assignment create \
+  --assignee "$APP_ID" \
+  --role AcrPush \
+  --scope "$ACR_ID"
 ```
 
-Override the port with `-e PORT=9090` if you don't want 8080.
+## 4. Create OIDC Credential
 
-## Project layout
-
+```bash
+az ad app federated-credential create \
+  --id "$APP_ID" \
+  --parameters '{
+    "name": "github-actions-environment",
+    "issuer": "https://token.actions.githubusercontent.com",
+    "subject": "repo:<YOUR_GITHUB_ORG>/<YOUR_GITHUB_REPO>:environment:<YOUR_GITHUB_ENVIRONMENT>",
+    "audiences": ["api://AzureADTokenExchange"]
+  }'
 ```
-cmd/app/main.go   # entrypoint
-go.mod / go.sum   # module def (no external deps yet)
-Dockerfile        # multi-stage build, distroless runtime
+
+## 5. Get Azure IDs
+
+```bash
+TENANT_ID=$(az account show --query tenantId -o tsv)
+SUBSCRIPTION_ID=$(az account show --query id -o tsv)
 ```
 
-When you add real dependencies, run `go mod tidy` locally to populate
-`go.sum` before building the Docker image — `go mod download` in the
-Dockerfile needs it to match.
+## 6. Add GitHub Environment Secrets
+
+```bash
+gh secret set AZURE_CLIENT_ID \
+  --body "$APP_ID" \
+  --repo "$GITHUB_ORG/$GITHUB_REPO" \
+  --env "$GITHUB_ENVIRONMENT"
+
+gh secret set AZURE_TENANT_ID \
+  --body "$TENANT_ID" \
+  --repo "$GITHUB_ORG/$GITHUB_REPO" \
+  --env "$GITHUB_ENVIRONMENT"
+
+gh secret set AZURE_SUBSCRIPTION_ID \
+  --body "$SUBSCRIPTION_ID" \
+  --repo "$GITHUB_ORG/$GITHUB_REPO" \
+  --env "$GITHUB_ENVIRONMENT"
+```
+
+## 7. GitHub Actions Workflow
+
+Create:
+
+```text
+.github/workflows/build-and-push.yml
+```
+
+```yaml
+name: Build and Push to ACR
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    environment: <YOUR_GITHUB_ENVIRONMENT>
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Login to Azure
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Login to ACR
+        run: az acr login --name <YOUR_ACR_NAME>
+
+      - name: Build and Push
+        run: |
+          docker build \
+            -t <YOUR_ACR_LOGIN_SERVER>/<YOUR_IMAGE_NAME>:${{ github.run_number }} .
+
+          docker push \
+            <YOUR_ACR_LOGIN_SERVER>/<YOUR_IMAGE_NAME>:${{ github.run_number }}
+```
+
+## Result
+
+GitHub Actions authenticates to Azure using **OIDC**, logs into ACR, builds the Docker image, and pushes it to your registry.
+
+No Azure client secret or password is stored in GitHub.
