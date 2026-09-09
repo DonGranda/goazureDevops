@@ -36,7 +36,10 @@ jobs:
             - name: ACR login
               run: az acr login --name ${{ vars.ACR_NAME }}
 
-            - name: Build and push
+            - name: Build Image
               run: |
-                  docker build -t ${{ vars.ACR_LOGIN_SERVER }}/${{ vars.IMAGE_NAME }}:${{ github.sha }} .
-                  docker push ${{ vars.ACR_LOGIN_SERVER }}/${{ vars.IMAGE_NAME }}:${{ github.sha }}
+                  docker build -t ${{ vars.ACR_LOGIN_SERVER }}/${{ vars.IMAGE_NAME }}:${{ github.run_number }} .
+
+            - name: Push to ACR
+              run: |
+                  docker push ${{ vars.ACR_LOGIN_SERVER }}/${{ vars.IMAGE_NAME }}:${{ github.run_number }} 
