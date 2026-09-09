@@ -1,0 +1,61 @@
+name: Deploy to AKS
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Environment to deploy to"
+        required: true
+        type: choice
+        options:
+          - DEV
+          - UAT
+          - PROD
+        default: DEV
+      image_tag:
+        description: "Image tag to deploy (the run number from the build workflow)"
+        required: true
+        type: string
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Azure login (OIDC)
+        uses: azure/login@7ddb5af1ef8758cf1353cf3b42f940aee27ba21c
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Set AKS context
+        uses: azure/aks-set-context@v4
+        with:
+          resource-group: ${{ vars.AKS_RESOURCE_GROUP }}
+          cluster-name: ${{ vars.AKS_CLUSTER_NAME }}
+
+      - name: Install Helm
+        uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310
+
+      - name: Compute namespace
+        id: ns
+        run: echo "namespace=$(echo '${{ inputs.environment }}' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
+
+      - name: Helm lint
+        run: helm lint ./k8s/helm/go-test
+
+      - name: Deploy with Helm
+        run: |
+          helm upgrade --install go-test ./k8s/helm/go-test \
+            --namespace ${{ steps.ns.outputs.namespace }} \
+            --create-namespace \
+            --set image.repository=${{ vars.ACR_LOGIN_SERVER }}/${{ vars.IMAGE_NAME }} \
+            --set image.tag=${{ inputs.image_tag }} \
+            --wait --timeout 5m
