@@ -1,0 +1,172 @@
+name: Build, Push, and Deploy
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Environment to target"
+        required: true
+        type: choice
+        options:
+          - DEV
+          - UAT
+          - PROD
+        default: DEV
+      run_mode:
+        description: "Push to ACR only, or push and deploy with Helm"
+        required: true
+        type: choice
+        options:
+          - push_only
+          - deploy
+        default: push_only
+      helm_action:
+        description: "Helm action (only used when run_mode = deploy)"
+        required: true
+        type: choice
+        options:
+          - install
+          - upgrade
+          - uninstall
+          - delete
+          - rollback
+        default: upgrade
+      namespace:
+        description: "Namespace override. Leave blank to auto-derive from environment (dev/uat/prod)"
+        required: false
+        type: string
+      image_tag:
+        description: "Image tag to deploy. Leave blank to use this run's freshly built tag (install/upgrade only)"
+        required: false
+        type: string
+      rollback_revision:
+        description: "Revision to roll back to (rollback only). Leave blank for the previous revision"
+        required: false
+        type: string
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  build-and-push:
+    name: CI - Build & Push to ACR
+    runs-on: ubuntu-latest
+    if: |
+      github.event_name == 'pull_request' ||
+      (github.event_name == 'workflow_dispatch' &&
+       inputs.helm_action != 'uninstall' &&
+       inputs.helm_action != 'delete' &&
+       inputs.helm_action != 'rollback')
+    environment: ${{ github.event_name == 'workflow_dispatch' && inputs.environment || 'DEV' }}
+    outputs:
+      image_tag: ${{ steps.tag.outputs.image_tag }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Azure login (OIDC)
+        uses: azure/login@7ddb5af1ef8758cf1353cf3b42f940aee27ba21c
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: ACR login
+        run: az acr login --name ${{ vars.ACR_NAME }}
+
+      - name: Set image tag
+        id: tag
+        run: echo "image_tag=${{ github.run_number }}" >> "$GITHUB_OUTPUT"
+
+      - name: Build image
+        run: |
+          docker build -t ${{ vars.ACR_LOGIN_SERVER }}/${{ github.event.repository }}:${{ steps.tag.outputs.image_tag }} .
+
+      - name: Push to ACR
+        run: |
+          docker push ${{ vars.ACR_LOGIN_SERVER }}/${{ vars.IMAGE_NAME }}:${{ steps.tag.outputs.image_tag }}
+
+  deploy:
+    name: CD - Deploy to AKS with Helm
+    needs: build-and-push
+    if: |
+      needs.build-and-push.result != 'failure' &&
+      needs.build-and-push.result != 'cancelled' &&
+      github.event_name == 'workflow_dispatch' &&
+      inputs.run_mode == 'deploy'
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Azure login (OIDC)
+        uses: azure/login@7ddb5af1ef8758cf1353cf3b42f940aee27ba21c
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Set AKS context
+        uses: azure/aks-set-context@v5
+        with:
+          resource-group: ${{ vars.AKS_RESOURCE_GROUP }}
+          cluster-name: ${{ vars.AKS_CLUSTER_NAME }}
+
+      - name: Install Helm
+        uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310
+
+      - name: Compute namespace
+        id: ns
+        run: |
+          if [ -n "${{ inputs.namespace }}" ]; then
+            echo "namespace=${{ inputs.namespace }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "namespace=$(echo '${{ inputs.environment }}' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Compute image tag
+        id: img
+        if: inputs.helm_action == 'install' || inputs.helm_action == 'upgrade'
+        run: |
+          if [ -n "${{ inputs.image_tag }}" ]; then
+            echo "image_tag=${{ inputs.image_tag }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "image_tag=${{ needs.build-and-push.outputs.image_tag }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Helm lint
+        if: inputs.helm_action == 'install' || inputs.helm_action == 'upgrade'
+        run: helm lint ./k8s/helm/go-test
+
+      - name: Helm install
+        if: inputs.helm_action == 'install'
+        run: |
+          helm install go-test ./k8s/helm/go-test \
+            --namespace ${{ steps.ns.outputs.namespace }} \
+            --create-namespace \
+            --set image.repository=${{ vars.ACR_LOGIN_SERVER }}/${{ vars.IMAGE_NAME }} \
+            --set image.tag=${{ steps.img.outputs.image_tag }} \
+            --wait --timeout 5m
+
+      - name: Helm upgrade
+        if: inputs.helm_action == 'upgrade'
+        run: |
+          helm upgrade go-test ./k8s/helm/go-test \
+            --namespace ${{ steps.ns.outputs.namespace }} \
+            --set image.repository=${{ vars.ACR_LOGIN_SERVER }}/${{ vars.IMAGE_NAME }} \
+            --set image.tag=${{ steps.img.outputs.image_tag }} \
+            --wait --timeout 5m
+
+      - name: Helm uninstall / delete
+        if: inputs.helm_action == 'uninstall' || inputs.helm_action == 'delete'
+        run: |
+          helm uninstall go-test --namespace ${{ steps.ns.outputs.namespace }}
+
+      - name: Helm rollback
+        if: inputs.helm_action == 'rollback'
+        run: |
+          helm rollback go-test ${{ inputs.rollback_revision }} \
+            --namespace ${{ steps.ns.outputs.namespace }} \
+            --wait --timeout 5m
