@@ -32,6 +32,10 @@ chart, so the container deploys as-is.
   - [Step 7: Store secrets in each GitHub Environment](#step-7-store-secrets-in-each-github-environment)
   - [Step 8: Add the workflow](#step-8-add-the-workflow)
   - [Step 9: Open a pull request, or trigger it manually](#step-9-open-a-pull-request-or-trigger-it-manually)
+  - [Step 10: Verify the pushed image](#step-10-verify-the-pushed-image)
+- [3. Helm chart (k8s/helm/go-test)](#3-helm-chart-k8shelmgo-test)
+- [4. AKS permissions for GitHub Actions](#4-aks-permissions-for-github-actions)
+- [5. Workflows: what's different in ci-cd.yml](#5-workflows-whats-different-in-ci-cdyml)
 ---
 
 ## 1. Run the app locally
@@ -369,3 +373,126 @@ az acr repository show-tags \
   --repository <IMAGE_NAME> \
   -o table
 ```
+
+
+## 3. Helm chart (`k8s/helm/go-test`)
+
+The chart lives under `k8s/helm/go-test` and was scaffolded with `helm create
+go-test`, then wired up to match this app instead of leaving the sample
+nginx stuff sitting in there unused.
+
+What's actually hooked up:
+
+- `image.repository` / `image.tag` in `values.yaml` point at the ACR image.
+  The tag is left blank by default and gets overriden at deploy time
+  (`--set image.tag=...`) with whatever run number built it, so
+  `values.yaml` itself doesnt need to be touched for a normal deploy.
+- `service.port` is `8080`, matching the port the Go app actually listens
+  on (see `cmd/app/main.go`).
+- `livenessProbe` hits `/healthz`, `readinessProbe` hits `/readyz`. Both are
+  real endpoints on the app, not the generic `/` path the chart ships with
+  out of the box. (This one got fixed a bit late in the process — it was
+  originally still pointed at `/`, which is just the index route and
+  doesn't really tell you whether the app is ready to take traffic or not,
+  so it wasnt a great signal for readiness.)
+- Ingress and the Gateway API `httpRoute` template are both still disabled
+  (`ingress.enabled: false`, `httpRoute.enabled: false`), so right now the
+  Service is ClusterIP only — reachable from inside the cluster, not from
+  outside. Testing it means either `kubectl port-forward` or exec'ing into
+  another pod. If it needs to be public later that's a values.yaml flip
+  plus an ingress controller on the cluster, not a template change.
+
+Everything else in the chart (`serviceaccount.yaml`, `hpa.yaml`, the test
+hook, `_helpers.tpl`) is still the stock `helm create` output, untouched.
+
+## 4. AKS permissions for GitHub Actions
+
+Getting the pipeline from "image sits in ACR" to "image is actually running
+in AKS" needed two seperate bits of Azure plumbing on top of what was
+already set up for the ACR push part.
+
+**a) Letting AKS pull the image**
+
+This is the cluster's own identity being allowed to pull from the
+registry — completely seperate from anything GitHub Actions does:
+
+```bash
+az aks update \
+  --resource-group <AKS_RESOURCE_GROUP> \
+  --name <AKS_CLUSTER_NAME> \
+  --attach-acr <ACR_NAME>
+```
+
+This grants the AKS kubelet identity `AcrPull` on the registry behind the
+scenes. Confirmed it actually worked with:
+
+```bash
+az aks check-acr \
+  --resource-group <AKS_RESOURCE_GROUP> \
+  --name <AKS_CLUSTER_NAME> \
+  --acr <ACR_NAME>.azurecr.io
+```
+
+**b) Letting the GitHub Actions identity talk to the AKS control plane**
+
+Reused the same `github-actions-acr` app registration / service principal
+that's already doing OIDC login for the ACR push jobs — no need for a
+second identity just for this. Just gave it one more role, scoped to the
+cluster this time instead of the registry:
+
+```bash
+AKS_ID=$(az aks show \
+  --name <AKS_CLUSTER_NAME> \
+  --resource-group <AKS_RESOURCE_GROUP> \
+  --query id -o tsv)
+
+az role assignment create \
+  --assignee "$APP_ID" \
+  --role "Azure Kubernetes Service Cluster User Role" \
+  --scope "$AKS_ID"
+```
+
+That one role is enough here. Checked `az aks show` and this cluster comes
+back with `"aadProfile": null`, meaning Azure RBAC for Kubernetes
+authorization isnt turned on for it — so there's no seperate "RBAC Writer"
+role that needs adding on top. Once the workflow has Cluster User access
+it can pull a kubeconfig and `helm upgrade` just works off the cluster's
+own local auth from there.
+
+`AKS_RESOURCE_GROUP` and `AKS_CLUSTER_NAME` are stored as environment
+**variables** (not secrets — neither one is sensitive) under each of
+`DEV`/`UAT`/`PROD`, same place `ACR_NAME` and the others live.
+
+## 5. Workflows: what's different in `ci-cd.yml`
+
+There's three workflow files under `.github/workflows/` now, and it's
+worth spelling out why, since it's not obvious at a glance which one to
+actually run:
+
+- **`push-to-acr.yml`** — the original one. Builds and pushes the image to
+  ACR on every pull request, or manually against any environment. Doesnt
+  touch AKS at all.
+- **`deploy-from-acr-aks.yml`** — a seperate, deploy-only workflow. You
+  trigger it manually and have to type in the image tag you want deployed
+  (copied over from whatever `push-to-acr.yml` run built it). Fine for a
+  quick one-off deploy, but it means jumping between two workflow runs and
+  copy pasting a run number in between.
+- **`ci-cd.yml`** — the new one, and the one meant to replace running the
+  other two by hand. It combines both jobs into a single workflow:
+  - on a pull request it just builds and pushes (`run_mode: push_only`),
+    same as before — no cluster access touched at all
+  - on a manual run you can pick `run_mode: deploy` and it'll build, push,
+    *then* deploy with Helm in the same run. The image tag gets passed
+    automatically between the two jobs
+    (`needs.build-and-push.outputs.image_tag`) so there's no more copying
+    a tag by hand between two seperate workflows
+  - it also adds a `helm_action` input (`install`, `upgrade`, `uninstall`,
+    `delete`, `rollback`), so the same workflow can tear a release down or
+    roll it back too, not just install/upgrade it
+  - `namespace` can be overridden manually, otherwise it's derived from
+    the environment (`dev`/`uat`/`prod`)
+
+`push-to-acr.yml` and `deploy-from-acr-aks.yml` are both still there and
+still work fine on their own if you need them, but `ci-cd.yml` is the one
+to reach for day to day, since it covers the whole build-push-deploy
+chain (plus rollback/uninstall) from a single place instead of two.
