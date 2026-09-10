@@ -1,4 +1,4 @@
-name: Build, Push, and Deploy
+name: CI/CD - Build, Push, and Deploy
 
 on:
   pull_request:
@@ -63,6 +63,7 @@ jobs:
     environment: ${{ github.event_name == 'workflow_dispatch' && inputs.environment || 'DEV' }}
     outputs:
       image_tag: ${{ steps.tag.outputs.image_tag }}
+      image_name: ${{ steps.imgname.outputs.image_name }}
     steps:
       - uses: actions/checkout@v7
 
@@ -80,13 +81,17 @@ jobs:
         id: tag
         run: echo "image_tag=${{ github.run_number }}" >> "$GITHUB_OUTPUT"
 
+      - name: Set image name
+        id: imgname
+        run: echo "image_name=$(echo '${{ github.event.repository.name }}' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
+
       - name: Build image
         run: |
-          docker build -t ${{ vars.ACR_LOGIN_SERVER }}/${{ github.event.repository }}:${{ steps.tag.outputs.image_tag }} .
+          docker build -t ${{ vars.ACR_LOGIN_SERVER }}/${{ steps.imgname.outputs.image_name }}:${{ steps.tag.outputs.image_tag }} .
 
       - name: Push to ACR
         run: |
-          docker push ${{ vars.ACR_LOGIN_SERVER }}/${{ vars.IMAGE_NAME }}:${{ steps.tag.outputs.image_tag }}
+          docker push ${{ vars.ACR_LOGIN_SERVER }}/${{ steps.imgname.outputs.image_name }}:${{ steps.tag.outputs.image_tag }}
 
   deploy:
     name: CD - Deploy to AKS with Helm
@@ -146,7 +151,7 @@ jobs:
           helm install go-test ./k8s/helm/go-test \
             --namespace ${{ steps.ns.outputs.namespace }} \
             --create-namespace \
-            --set image.repository=${{ vars.ACR_LOGIN_SERVER }}/${{ vars.IMAGE_NAME }} \
+            --set image.repository=${{ vars.ACR_LOGIN_SERVER }}/${{ needs.build-and-push.outputs.image_name }} \
             --set image.tag=${{ steps.img.outputs.image_tag }} \
             --wait --timeout 5m
 
@@ -155,7 +160,7 @@ jobs:
         run: |
           helm upgrade go-test ./k8s/helm/go-test \
             --namespace ${{ steps.ns.outputs.namespace }} \
-            --set image.repository=${{ vars.ACR_LOGIN_SERVER }}/${{ vars.IMAGE_NAME }} \
+            --set image.repository=${{ vars.ACR_LOGIN_SERVER }}/${{ needs.build-and-push.outputs.image_name }} \
             --set image.tag=${{ steps.img.outputs.image_tag }} \
             --wait --timeout 5m
 
