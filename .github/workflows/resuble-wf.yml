@@ -21,3 +21,5 @@ jobs:
   build:
     uses: DonGranda/reuseable_workflow/.github/workflows/build-acr-aks.yml@v2.0.0
     secrets: inherit
+    with:
+      environment: ${{ inputs.environment }}
