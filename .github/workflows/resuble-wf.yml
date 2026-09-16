@@ -1,0 +1,19 @@
+name: Build Go App
+on: 
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Environment to deploy to"
+        required: true
+        type: choice
+        options:
+          - DEV
+          - UAT
+          - PROD
+        default: DEV
+jobs:
+  build:
+    uses: DonGranda/reuseable_workflow/.github/workflows/build-acr-aks.yml@v2.0.0
+    secrets: inherit
+    
+ 
